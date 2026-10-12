@@ -1,0 +1,228 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Livewire\Pages\JobCreatePage;
+use App\Livewire\Pages\JobEditPage;
+use App\Livewire\Pages\JobShowPage;
+use App\Models\Job;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Livewire\Livewire;
+use Tests\TestCase;
+
+class JobWorkflowTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_a_quote_can_be_approved_scheduled_dispatched_completed_and_paid_in_installments(): void
+    {
+        $this->actingAs(User::factory()->create());
+
+        Livewire::test(JobCreatePage::class)
+            ->set('form', [
+                'site_full_name' => 'Taylor Customer',
+                'site_telephone' => '555-0100',
+                'site_address' => '12 Main Street',
+                'site_city' => 'Brooklyn',
+                'booked_date' => today()->toDateString(),
+                'job_type' => 'estimate',
+                'items' => [[
+                    'area_item' => 'Area rug',
+                    'length' => 10,
+                    'width' => 15,
+                    'description' => 'Cleaning',
+                    'unit' => '1',
+                    'quantity' => 1,
+                    'time' => '01:30',
+                    'amount' => 150,
+                ]],
+            ])
+            ->call('save')
+            ->assertRedirect();
+
+        $job = Job::with('lineItems')->firstOrFail();
+        $this->assertSame('quote', $job->status);
+        $this->assertSame(150.0, (float) $job->lineItems->first()->quantity);
+        $this->assertSame(150.0, (float) $job->total);
+        $this->assertSame('12 Main Street', $job->billing_address);
+        $this->assertSame('Brooklyn', $job->billing_city);
+        $this->get(route('jobs.create'))
+            ->assertOk()
+            ->assertSee('wire:submit="save"', false)
+            ->assertSee('wire:model="form.site_full_name"', false)
+            ->assertSee('wire:click="addItem"', false);
+        $this->get(route('jobs.quote', $job))->assertOk()->assertSee('Service estimate');
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->call('confirmQuote')
+            ->assertRedirect(route('jobs.show', $job));
+        $job->refresh();
+        $this->assertSame('approved', $job->status);
+        $this->assertNotNull($job->job_number);
+        $this->get(route('jobs.show', $job))->assertOk()->assertDontSee('Mark quote approved');
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->set('schedule', [
+                'crew_route' => 'Brooklyn',
+                'scheduled_date' => now()->addDay()->toDateString(),
+                'scheduled_time' => '09:00',
+                'best_time' => '09:15',
+                'technicians' => [
+                    ['technician_name' => 'Sam', 'time' => '09:00', 'amount' => 35],
+                ],
+            ])
+            ->call('schedule')
+            ->assertRedirect(route('jobs.show', $job));
+        $job->refresh();
+        $this->assertSame('scheduled', $job->status);
+        $this->assertSame(1, $job->technicians()->count());
+        $this->get(route('jobs.edit', $job))->assertOk();
+        Livewire::test(JobEditPage::class, ['job' => $job])
+            ->set('form', [
+                'job_type' => 'estimate',
+                'site_full_name' => 'Taylor Customer Updated',
+                'site_telephone' => '555-0100',
+                'booked_date' => now()->toDateString(),
+                'items' => [[
+                    'area_item' => 'Area rug',
+                    'length' => 10,
+                    'width' => 15,
+                    'description' => 'Cleaning',
+                    'unit' => '1',
+                    'quantity' => 1,
+                    'time' => '01:30',
+                    'amount' => 150,
+                ]],
+            ])
+            ->call('save')
+            ->assertRedirect(route('jobs.show', $job));
+        $job->refresh();
+        $this->assertSame('scheduled', $job->status);
+        $this->assertSame('Brooklyn', $job->crew_route);
+        $this->assertSame('09:00', $job->scheduled_time);
+        $this->assertSame(1, $job->technicians()->count());
+        $this->get(route('jobs.dispatch', $job))->assertOk()->assertSee('Sam');
+
+        $this->get(route('jobs.quote.download', $job))
+            ->assertOk()
+            ->assertHeader('content-type', 'application/pdf');
+
+        $this->get(route('jobs.dispatch.print', $job))
+            ->assertOk()
+            ->assertHeader('content-type', 'application/pdf');
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->call('markDispatched')
+            ->assertRedirect(route('jobs.show', $job));
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->call('complete')
+            ->assertRedirect(route('jobs.show', $job));
+        $job->refresh();
+        $this->assertSame('completed', $job->status);
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->set('payment', [
+                'payment_method' => 'card',
+                'amount' => 100,
+                'transaction_date' => now()->toDateString(),
+                'card_last_four' => '1234',
+                'card_expiry_month' => 8,
+                'card_expiry_year' => 2030,
+                'account_reference' => '1234',
+                'explanation' => 'Deposit received',
+                'notes' => 'Installment one',
+            ])
+            ->call('recordPayment')
+            ->assertRedirect(route('jobs.show', $job));
+        $firstReceipt = $job->payments()->firstOrFail();
+        $job->refresh();
+        $this->assertSame(100.0, (float) $job->amount_paid);
+        $this->assertSame(50.0, (float) $job->balance);
+        $this->assertStringStartsWith('R-'.now()->format('Y').'-', $firstReceipt->receipt_no);
+        $this->assertSame('completed', $job->status);
+        $this->get(route('jobs.invoice', $job))
+            ->assertOk()
+            ->assertSee($firstReceipt->receipt_no)
+            ->assertSee('Exp 08/2030')
+            ->assertSee('Deposit received')
+            ->assertSee('Installment one')
+            ->assertSee('Balance after payment');
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->set('payment', [
+                'payment_method' => 'cash',
+                'amount' => 50,
+                'transaction_date' => now()->toDateString(),
+            ])
+            ->call('recordPayment')
+            ->assertRedirect(route('jobs.show', $job));
+        $job->refresh();
+        $this->assertSame(2, $job->payments()->count());
+        $this->assertSame(150.0, (float) $job->amount_paid);
+        $this->assertSame(0.0, (float) $job->balance);
+        $this->assertSame('paid', $job->status);
+
+        $this->get(route('jobs.invoice.download', $job))
+            ->assertOk()
+            ->assertHeader('content-type', 'application/pdf');
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->set('note', 'Call before arrival')
+            ->call('addNote')
+            ->assertRedirect(route('jobs.show', $job));
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->set('note', 'Leave invoice at the office')
+            ->call('addNote')
+            ->assertRedirect(route('jobs.show', $job));
+        $this->assertSame(2, $job->reminders()->count());
+    }
+
+    public function test_payment_cannot_store_a_full_numeric_card_or_account_number(): void
+    {
+        $this->actingAs(User::factory()->create());
+        $job = Job::create([
+            'status' => 'completed',
+            'job_type' => 'job',
+            'total' => 200,
+            'invoice_total' => 200,
+            'balance' => 200,
+        ]);
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->set('payment.payment_method', 'card')
+            ->set('payment.amount', 100)
+            ->set('payment.transaction_date', now()->toDateString())
+            ->set('payment.account_reference', '1234567890123456')
+            ->call('recordPayment')
+            ->assertHasErrors('payment.account_reference');
+
+        $this->assertSame(0, $job->payments()->count());
+    }
+
+    public function test_approval_assigns_a_number_above_all_existing_numbers_including_archived_jobs(): void
+    {
+        $this->actingAs(User::factory()->create());
+
+        $archivedJob = Job::create([
+            'job_number' => '62779',
+            'status' => 'completed',
+            'job_type' => 'job',
+        ]);
+        $archivedJob->delete();
+
+        Job::create([
+            'job_number' => '62778',
+            'status' => 'completed',
+            'job_type' => 'job',
+        ]);
+
+        $job = Job::create(['status' => 'quote']);
+
+        Livewire::test(JobShowPage::class, ['job' => $job])
+            ->call('confirmQuote')
+            ->assertRedirect(route('jobs.show', $job));
+
+        $this->assertSame('62780', $job->fresh()->job_number);
+    }
+}
